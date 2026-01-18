@@ -55,7 +55,7 @@ except ImportError:
     print("FATAL: 'pyobjc' missing. Install via: pip install pyobjc")
     sys.exit(1)
 
-# --- CONFIGURATION (STABILITY ENGINE v3.9) ---
+# --- CONFIGURATION (STABILITY ENGINE v4.0) ---
 WIDTH, HEIGHT = 640, 480
 MIRROR = True
 CURSOR_HZ = 120 
@@ -67,24 +67,28 @@ DRAG_FRICTION = 0.92
 STABLE_FRAMES_REQ = 3
 LOST_TIMEOUT = 0.2
 
-# Scale-Normalized Pinch Thresholds
+# Pinch Ratios (Thumb to Finger / Hand Size)
 PINCH_ON = 0.34
 PINCH_OFF = 0.42
 INDEX_CLEAR_MARGIN = 0.06
 MIDDLE_PINCH_ON = 0.40
 MIDDLE_PINCH_OFF = 0.52
 
+# Double-Finger Gesture (Double Click)
+TWO_FINGER_ON = 0.33
+TWO_FINGER_OFF = 0.45
+TWO_FINGER_FREEZE_S = 0.15
+
 # Drag Stability & Prevention
-DRAG_PINCH_ON = 0.30  # Requires stronger pinch to initiate drag
+DRAG_PINCH_ON = 0.30
 DRAG_RELEASE_RATIO = 0.50
 DRAG_RELEASE_HOLD_S = 0.15
 
-# State Machine Timing
+# Timing Constants
 DRAG_HOLD_S = 0.35
-DOUBLE_CLICK_WINDOW_S = 0.70
 SINGLE_CLICK_DELAY_S = 0.35
 
-# Click Precision & Nudge
+# Precision & Locking
 CLICK_LOCK_EXTRA_S = 0.05
 CLICK_FREEZE_AFTER_CLICK_S = 0.16 
 PRECISION_LOCK_S = 0.08
@@ -139,6 +143,7 @@ class AirMouseState:
         self.dragging = False
         self.click_anchor_x, self.click_anchor_y = 0.0, 0.0
         self.drag_release_start = None
+        self.two_finger_active = False
         
         # Pending Click Dispatcher
         self.pending_single = False
@@ -165,6 +170,7 @@ def reset_gestures():
     state.unpinch_frames = 0
     state.dragging = False
     state.scroll_mode = False
+    state.two_finger_active = False
     state.v_s = 0.0
     state.scroll_accum = 0.0
     state.vx = 0.0
@@ -342,6 +348,34 @@ try:
                 middle_pinch_ratio = middle_dist / hand_size
                 index_clear = (index_pinch_ratio > PINCH_OFF + INDEX_CLEAR_MARGIN)
 
+                # Gesture conditions
+                two_finger_pinched = (index_pinch_ratio < TWO_FINGER_ON) and (middle_pinch_ratio < TWO_FINGER_ON)
+                two_finger_clear = (index_pinch_ratio > TWO_FINGER_OFF) and (middle_pinch_ratio > TWO_FINGER_OFF)
+
+                # --- 1. TWO-FINGER DOUBLE CLICK (PRIORITY OVERRIDE) ---
+                if two_finger_pinched and not state.two_finger_active:
+                    # Cancel all other interactions
+                    state.scroll_mode = False
+                    state.pending_single = False
+                    state.index_pinched = False
+                    state.dragging = False
+                    state.unpinch_frames = 0
+                    state.pinch_start_time = None
+                    state.drag_release_start = None
+                    state.click_lock_active = False
+
+                    # Fire OS double click immediately
+                    double_click(state.x, state.y)
+                    state.two_finger_active = True
+                    state.pointer_freeze_until = now + TWO_FINGER_FREEZE_S
+                    continue # Skip other gesture logic this frame
+
+                elif state.two_finger_active:
+                    if two_finger_clear:
+                        state.two_finger_active = False
+                    continue # Wait for release, skip other logic
+
+                # --- 2. SCROLL MODE CLUTCH ---
                 if middle_pinch_ratio < MIDDLE_PINCH_ON and index_clear:
                     if not state.scroll_mode:
                         if state.dragging:
@@ -355,6 +389,7 @@ try:
                 elif middle_pinch_ratio > MIDDLE_PINCH_OFF:
                     state.scroll_mode = False
 
+                # Cursor Observation
                 x_norm = max(0, min((lms[8].x - ACTIVE_MIN) / (ACTIVE_MAX - ACTIVE_MIN), 1))
                 y_norm = max(0, min((lms[8].y - ACTIVE_MIN) / (ACTIVE_MAX - ACTIVE_MIN), 1))
                 new_obs_x, new_obs_y = x_norm * SCREEN_W, y_norm * SCREEN_H
@@ -369,6 +404,7 @@ try:
                     state.new_observation = True
                     state.have_obs = True
 
+                # --- 3. INDEX PINCH STATE MACHINE (CLICK & DRAG) ---
                 if not state.scroll_mode:
                     if not state.index_pinched and index_pinch_ratio < PINCH_ON:
                         state.index_pinched = True
@@ -402,22 +438,16 @@ try:
                             if state.unpinch_frames >= UNPINCH_STABLE_REQ:
                                 state.index_pinched = False
                                 state.click_lock_active = False
-                                dt_since_last_pending = now - state.pending_single_time
-                                if state.pending_single and dt_since_last_pending <= DOUBLE_CLICK_WINDOW_S:
-                                    double_click(state.pending_anchor_x, state.pending_anchor_y)
-                                    state.pending_single = False
-                                    state.click_lock_until = now + CLICK_LOCK_EXTRA_S
-                                    state.pointer_freeze_until = now + CLICK_FREEZE_AFTER_CLICK_S
-                                else:
-                                    state.pending_single = True
-                                    state.pending_single_time = now
-                                    state.pending_anchor_x, state.pending_anchor_y = state.click_anchor_x, state.click_anchor_y
-                                    state.click_lock_until = now + CLICK_LOCK_EXTRA_S
+                                
+                                # Mark for single click dispatcher (No timing upgrade to double)
+                                state.pending_single = True
+                                state.pending_single_time = now
+                                state.pending_anchor_x, state.pending_anchor_y = state.click_anchor_x, state.click_anchor_y
+                                state.click_lock_until = now + CLICK_LOCK_EXTRA_S
                                 
                                 state.pinch_start_time = None
 
                         if state.index_pinched and not state.dragging:
-                            # TRIGGER DRAG (Modified v3.9)
                             if (now - state.pinch_start_time >= DRAG_HOLD_S) and (index_pinch_ratio < DRAG_PINCH_ON):
                                 post_mouse_event(kCGEventLeftMouseDown, state.click_anchor_x, state.click_anchor_y, click_count=1)
                                 state.dragging = True
@@ -436,10 +466,9 @@ try:
                     state.v_s = 0.0
                     state.prev_center_y, state.prev_center_t = None, None
 
-            # Pending Single-Click Dispatcher (Modified v3.9: Precision Snap)
+            # --- 4. PENDING SINGLE CLICK DISPATCHER ---
             if state.pending_single:
                 if (now - state.pending_single_time) > SINGLE_CLICK_DELAY_S:
-                    # Apply Precision Snap before firing
                     state.pointer_freeze_until = now + PRECISION_LOCK_S
                     state.vx = 0
                     state.vy = 0
@@ -459,14 +488,12 @@ try:
                 state.tracking_enabled = False
                 reset_gestures()
 
-        status = "PAUSED" if state.paused else ("NO HAND" if not state.tracking_enabled else ("SCROLLING" if state.scroll_mode else ("DRAGGING" if state.dragging else "READY")))
+        status = "PAUSED" if state.paused else ("NO HAND" if not state.tracking_enabled else ("DOUBLE CLICKING" if state.two_finger_active else ("SCROLLING" if state.scroll_mode else ("DRAGGING" if state.dragging else "READY"))))
         color = (0, 0, 255) if state.paused or not state.tracking_enabled else (0, 255, 0)
-        cv2.putText(frame, f"v3.9 | {status}", (20, 40), 1, 1.4, color, 2)
+        cv2.putText(frame, f"v4.0 | {status}", (20, 40), 1, 1.4, color, 2)
         if state.index_pinched and not state.dragging:
             progress = min(1.0, (now - state.pinch_start_time) / DRAG_HOLD_S)
             cv2.rectangle(frame, (20, 60), (20 + int(progress*150), 75), (255, 255, 0), -1)
-        if state.pending_single:
-            cv2.circle(frame, (20, 90), 5, (255, 0, 255), -1)
             
         cv2.imshow('Air Mouse Pro', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
