@@ -1,503 +1,400 @@
 
 import cv2
-import time
 import threading
 import sys
 import math
+import time
 
-# --- ENVIRONMENT CHECK ---
+from snap_targeting import SnapTargeting
+from snap_controller import SnapController
+from overlay_cursor import CursorOverlayManager
+
 try:
     import numpy as np
     import mediapipe as mp
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
-except (ImportError, AttributeError) as e:
-    print("-" * 60)
-    print(f"FATAL: MediaPipe missing.")
+except ImportError:
+    print("FATAL: mediapipe missing.")
     sys.exit(1)
 
 try:
     from Quartz import (
-        CGEventCreateMouseEvent,
-        CGEventPost,
-        kCGEventMouseMoved,
-        kCGEventLeftMouseDown,
-        kCGEventLeftMouseUp,
-        kCGEventLeftMouseDragged,
-        kCGMouseButtonLeft,
-        kCGHIDEventTap,
-        CGEventCreateScrollWheelEvent,
-        kCGScrollEventUnitLine,
-        CGEventSetIntegerValueField,
-        kCGMouseEventClickState,
-        CGEventTapCreate,
-        CGEventTapEnable,
-        kCGHeadInsertEventTap,
-        kCGEventTapOptionDefault,
-        kCGEventKeyDown,
-        CGEventMaskBit,
-        CGEventGetFlags,
-        CGEventGetIntegerValueField,
-        kCGKeyboardEventKeycode,
-        kCGEventFlagMaskCommand,
-        kCGEventFlagMaskShift,
-        kCGEventFlagMaskControl,
-        kCGEventFlagMaskAlternate,
-        CFMachPortCreateRunLoopSource,
-        CFRunLoopAddSource,
-        CFRunLoopGetCurrent,
-        kCFRunLoopCommonModes,
-        CFRunLoopRun
+        CGEventCreateMouseEvent, CGEventPost, kCGHIDEventTap,
+        kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp,
+        kCGMouseButtonLeft, kCGEventFlagMaskCommand, kCGEventFlagMaskControl,
+        kCGEventFlagMaskAlternate, kCGEventKeyDown, kCGEventKeyUp, CGEventMaskBit,
+        CGEventTapCreate, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+        CFMachPortCreateRunLoopSource, CFRunLoopAddSource, CFRunLoopGetCurrent,
+        kCFRunLoopCommonModes, CFRunLoopRun, CGEventGetIntegerValueField,
+        CGEventGetFlags, kCGKeyboardEventKeycode, kCGMouseEventClickState,
+        CGEventSetIntegerValueField, kCGEventLeftMouseDragged,
+        CGEventCreateScrollWheelEvent, kCGScrollEventUnitPixel,
+        CGEventCreateKeyboardEvent, CGEventSetFlags
     )
     from AppKit import NSScreen
 except ImportError:
-    print("-" * 60)
-    print("FATAL: 'pyobjc' missing. Install via: pip install pyobjc")
+    print("FATAL: pyobjc missing.")
     sys.exit(1)
 
-# --- CONFIGURATION (STABILITY ENGINE v4.0) ---
-WIDTH, HEIGHT = 640, 480
-MIRROR = True
-CURSOR_HZ = 120 
-AB_ALPHA = 0.55 
-AB_BETA = 0.02
-DRAG_ALPHA = 0.75
-FRICTION = 0.88
-DRAG_FRICTION = 0.92
-STABLE_FRAMES_REQ = 3
-LOST_TIMEOUT = 0.2
-
-# Pinch Ratios (Thumb to Finger / Hand Size)
-PINCH_ON = 0.34
-PINCH_OFF = 0.42
-INDEX_CLEAR_MARGIN = 0.06
-MIDDLE_PINCH_ON = 0.40
-MIDDLE_PINCH_OFF = 0.52
-
-# Double-Finger Gesture (Double Click)
-TWO_FINGER_ON = 0.33
-TWO_FINGER_OFF = 0.45
-TWO_FINGER_FREEZE_S = 0.15
-
-# Drag Stability & Prevention
-DRAG_PINCH_ON = 0.30
-DRAG_RELEASE_RATIO = 0.50
-DRAG_RELEASE_HOLD_S = 0.15
-
-# Timing Constants
-DRAG_HOLD_S = 0.35
-SINGLE_CLICK_DELAY_S = 0.35
-
-# Precision & Locking
-CLICK_LOCK_EXTRA_S = 0.05
-CLICK_FREEZE_AFTER_CLICK_S = 0.16 
-PRECISION_LOCK_S = 0.08
-CLICK_NUDGE_PX = 2
-CLICK_NUDGE_DELAY_S = 0.005
-ENABLE_CLICK_NUDGE = True
-
-# Scroll Tuning
-SCROLL_HZ = 60
-SCROLL_GAIN = 0.002
-SCROLL_MAX_STEP = 3
-SCROLL_DEADZONE = 140
-UNPINCH_STABLE_REQ = 1
-
-# --- ACTIVE REGION ---
-ACTIVE_MIN = 0.12   
-ACTIVE_MAX = 0.88   
-EDGE_MARGIN = 0.07  
-EDGE_DAMP_FACTOR = 0.25 
-SCREEN_SOFT_CLAMP = 40 
-
-# Emergency Pause: Cmd + Ctrl + Opt + P
-HOTKEY_KEYCODE = 35 
+# --- CONFIG & TUNING ---
+DRAG_HOLD_S = 0.26           # Faster drag start
+DRAG_RELEASE_CONFIRM_S = 0.10 # Hysteresis for drag release
+SCROLL_MULT = 18.0
+HOTKEY_KEYCODE = 35 # 'P'
 HOTKEY_FLAGS = kCGEventFlagMaskCommand | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate
+TWO_FINGER_FREEZE_S = 0.22
+MAX_STEP_PX = 95.0
+ACTIVE_MIN = 0.12
+ACTIVE_MAX = 0.88
+SCROLL_DEADZONE_PX = 6
 
-# --- INITIALIZATION ---
-main_screen = NSScreen.mainScreen()
-screen_size = main_screen.frame().size
-SCREEN_W = int(screen_size.width)
-SCREEN_H = int(screen_size.height)
+# --- PRECISION & ADAPTIVE SMOOTHING CONFIG ---
+ALPHA_SLOW = 0.18    # Heavy smoothing for precision hovering
+ALPHA_FAST = 0.55    # Snappy response for rapid movement
+FAST_DIST_PX = 60.0  # Distance threshold to transition to fast alpha
+DEADBAND_PX = 2.2    # Ignore micro-tremors below this pixel delta
+
+# --- GESTURE THRESHOLDS (SENSITIVITY TWEAKS) ---
+PINCH_ON  = 0.36
+PINCH_OFF = 0.44
+MIDDLE_PINCH_ON  = 0.40
+MIDDLE_PINCH_OFF = 0.52
+TWO_FINGER_ON  = 0.35
+TWO_FINGER_OFF = 0.47
+INDEX_CLEAR_MARGIN = 0.06
+
+# --- FIST GESTURE CONFIG ---
+FIST_HOLD_S = 1.0
+FIST_COOLDOWN_S = 1.5
+FIST_RATIO_ON = 0.55  # Folded tip distance / hand size
+
+screen_frame = NSScreen.mainScreen().frame()
+SCREEN_W, SCREEN_H = int(screen_frame.size.width), int(screen_frame.size.height)
 
 class AirMouseState:
     def __init__(self):
         self.running = True
         self.paused = False
-        self.scroll_mode = False
-        self.x, self.y = SCREEN_W // 2, SCREEN_H // 2
-        self.vx, self.vy = 0.0, 0.0
-        self.tracking_enabled = False
-        self.have_obs = False
-        self.hand_present_frames = 0
-        self.last_hand_seen_time = 0
-        self.obs_x, self.obs_y = self.x, self.y
-        self.obs_time = None
-        self.last_obs_time = None
-        self.new_observation = False
+        self.x, self.y = SCREEN_W/2, SCREEN_H/2
+        self.obs_x, self.obs_y = SCREEN_W/2, SCREEN_H/2
+        self.active_x, self.active_y = self.x, self.y
         
-        # State Machine Fields (Click/Drag)
-        self.index_pinched = False
-        self.pinch_start_time = None
-        self.unpinch_frames = 0
+        # Snap State
+        self.snap_x, self.snap_y = SCREEN_W/2, SCREEN_H/2
+        self.snapped = False
+        self.target_data = None
+        self.last_ax_query_t = 0
+        
+        # Gestures
         self.dragging = False
-        self.click_anchor_x, self.click_anchor_y = 0.0, 0.0
         self.drag_release_start = None
+        self.scroll_mode = False
         self.two_finger_active = False
+        self.pinch_active = False
+        self.pinch_start_t = 0
+        self.freeze_until = 0
+        self.last_scroll_emit = 0
+        self.index_pinched = False
+        self.last_click_t = 0
+        self.last_double_t = 0
+        self.did_drag_this_pinch = False
+        self.drag_anchor_x, self.drag_anchor_y = 0, 0
+        self.scroll_start_t = 0
         
-        # Pending Click Dispatcher
-        self.pending_single = False
-        self.pending_single_time = 0.0
-        self.pending_anchor_x = 0.0
-        self.pending_anchor_y = 0.0
-
-        # Scroll Fields
-        self.v_s = 0.0
-        self.scroll_accum = 0.0
-        self.prev_center_y = None
-        self.prev_center_t = None
-        self.last_scroll_emit = 0.0
-        
-        # Precision Locks
-        self.pointer_freeze_until = 0.0
-        self.click_lock_active = False
-        self.click_lock_until = 0.0
+        # Fist / Minimize
+        self.fist_start_t = None
+        self.last_fist_action_t = 0.0
 
 state = AirMouseState()
+snap_targeting = SnapTargeting()
+snap_controller = SnapController()
+overlay = CursorOverlayManager()
 
-def reset_gestures():
-    state.index_pinched = False
-    state.unpinch_frames = 0
-    state.dragging = False
-    state.scroll_mode = False
-    state.two_finger_active = False
-    state.v_s = 0.0
-    state.scroll_accum = 0.0
-    state.vx = 0.0
-    state.vy = 0.0
-    state.new_observation = False
-    state.last_obs_time = None
-    state.prev_center_y = None
-    state.prev_center_t = None
-    state.pointer_freeze_until = 0.0
-    state.click_lock_until = 0.0
-    state.click_lock_active = False
-    state.pinch_start_time = None
-    state.drag_release_start = None
-    state.pending_single = False
+def post_mouse(etype, x, y, clicks=1):
+    ev = CGEventCreateMouseEvent(None, etype, (x, y), kCGMouseButtonLeft)
+    CGEventSetIntegerValueField(ev, kCGMouseEventClickState, clicks)
+    CGEventPost(kCGHIDEventTap, ev)
 
-def post_mouse_event(event_type, x, y, button=kCGMouseButtonLeft, click_count=1):
-    if state.paused: return
-    x = max(0, min(x, SCREEN_W - 1))
-    y = max(0, min(y, SCREEN_H - 1))
-    event = CGEventCreateMouseEvent(None, event_type, (x, y), button)
-    CGEventSetIntegerValueField(event, kCGMouseEventClickState, click_count)
-    CGEventPost(kCGHIDEventTap, event)
-
-def single_click(x, y):
-    post_mouse_event(kCGEventLeftMouseDown, x, y, click_count=1)
-    post_mouse_event(kCGEventLeftMouseUp,   x, y, click_count=1)
-
-def single_click_precise(x, y):
-    if not ENABLE_CLICK_NUDGE:
-        single_click(x, y)
-        return
-
-    dx = CLICK_NUDGE_PX
-    post_mouse_event(kCGEventMouseMoved, x + dx, y)
-    time.sleep(CLICK_NUDGE_DELAY_S)
-    post_mouse_event(kCGEventMouseMoved, x - dx, y)
-    time.sleep(CLICK_NUDGE_DELAY_S)
-    post_mouse_event(kCGEventMouseMoved, x, y)
-    time.sleep(CLICK_NUDGE_DELAY_S)
-
-    post_mouse_event(kCGEventLeftMouseDown, x, y, click_count=1)
-    post_mouse_event(kCGEventLeftMouseUp,   x, y, click_count=1)
+def post_scroll(dx, dy):
+    ev = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitPixel, 2, int(dy), int(dx))
+    CGEventPost(kCGHIDEventTap, ev)
 
 def double_click(x, y):
-    post_mouse_event(kCGEventLeftMouseDown, x, y, click_count=1)
-    post_mouse_event(kCGEventLeftMouseUp,   x, y, click_count=1)
-    time.sleep(0.01)
-    post_mouse_event(kCGEventLeftMouseDown, x, y, click_count=2)
-    post_mouse_event(kCGEventLeftMouseUp,   x, y, click_count=2)
+    post_mouse(kCGEventLeftMouseDown, x, y, clicks=1)
+    post_mouse(kCGEventLeftMouseUp, x, y, clicks=1)
+    time.sleep(0.015)
+    post_mouse(kCGEventLeftMouseDown, x, y, clicks=2)
+    post_mouse(kCGEventLeftMouseUp, x, y, clicks=2)
 
-# --- EMERGENCY STOP ---
-def event_tap_callback(proxy, type_, event, refcon):
-    if type_ == kCGEventKeyDown:
-        keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-        flags = CGEventGetFlags(event)
-        if keycode == HOTKEY_KEYCODE and (flags & HOTKEY_FLAGS) == HOTKEY_FLAGS:
-            state.paused = not state.paused
-            if state.paused: reset_gestures()
-            return None
-    return event
+def send_cmd_m():
+    KEY_M = 46
+    ev_down = CGEventCreateKeyboardEvent(None, KEY_M, True)
+    CGEventSetFlags(ev_down, kCGEventFlagMaskCommand)
+    CGEventPost(kCGHIDEventTap, ev_down)
+    ev_up = CGEventCreateKeyboardEvent(None, KEY_M, False)
+    CGEventSetFlags(ev_up, kCGEventFlagMaskCommand)
+    CGEventPost(kCGHIDEventTap, ev_up)
 
-def hotkey_listener():
-    event_mask = CGEventMaskBit(kCGEventKeyDown)
-    tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, event_mask, event_tap_callback, None)
-    if not tap: return
-    source = CFMachPortCreateRunLoopSource(None, tap, 0)
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
-    CGEventTapEnable(tap, True)
-    CFRunLoopRun()
+def is_closed_fist(lms, hand_size):
+    tips = [8, 12, 16, 20]
+    mcps = [5, 9, 13, 17]
+    ds = []
+    for t, m in zip(tips, mcps):
+        d = math.hypot(lms[t].x - lms[m].x, lms[t].y - lms[m].y) / hand_size
+        ds.append(d)
+    return (sum(ds) / len(ds)) < FIST_RATIO_ON
 
-threading.Thread(target=hotkey_listener, daemon=True).start()
+def action_pos():
+    return float(state.active_x), float(state.active_y)
 
-# --- CURSOR THREAD (120Hz) ---
 def cursor_thread():
-    dt = 1.0 / CURSOR_HZ
+    """120Hz Precision Dispatcher with Adaptive EMA and Deadband Filter"""
     while state.running:
         start_t = time.perf_counter()
-        now = start_t
-        if not state.paused and state.have_obs:
-            if not state.scroll_mode:
-                is_click_locked = (state.click_lock_active or now < state.click_lock_until) and not state.dragging
-                
-                if is_click_locked:
-                    state.vx = 0
-                    state.vy = 0
-                    state.x = state.click_anchor_x
-                    state.y = state.click_anchor_y
-                    post_mouse_event(kCGEventMouseMoved, state.x, state.y)
-                else:
-                    state.x += state.vx * dt
-                    state.y += state.vy * dt
-                    
-                    cur_friction = DRAG_FRICTION if state.dragging else FRICTION
-                    cur_alpha = DRAG_ALPHA if state.dragging else AB_ALPHA
+        if not state.paused:
+            # Calculate Delta for Adaptive Filtering
+            dx = state.obs_x - state.x
+            dy = state.obs_y - state.y
+            dist_delta = math.hypot(dx, dy)
 
-                    if state.x < SCREEN_SOFT_CLAMP or state.x > SCREEN_W - SCREEN_SOFT_CLAMP:
-                        state.vx *= 0.55
-                    if state.y < SCREEN_SOFT_CLAMP or state.y > SCREEN_H - SCREEN_SOFT_CLAMP:
-                        state.vy *= 0.55
-
-                    state.vx *= cur_friction
-                    state.vy *= cur_friction
-
-                    if state.new_observation:
-                        dx = state.obs_x - state.x
-                        dy = state.obs_y - state.y
-                        dt_obs = state.obs_time - (state.last_obs_time or (state.obs_time - 0.033))
-                        state.last_obs_time = state.obs_time
-                        dt_obs = max(1/120, min(dt_obs, 1/15))
-
-                        state.x += cur_alpha * dx
-                        state.y += cur_alpha * dy
-
-                        if abs(dx) < 140 and abs(dy) < 140:
-                            state.vx += (AB_BETA / dt_obs) * dx
-                            state.vy += (AB_BETA / dt_obs) * dy
-                        state.new_observation = False
-
-                    state.x = max(0, min(state.x, SCREEN_W - 1))
-                    state.y = max(0, min(state.y, SCREEN_H - 1))
-                    
-                    evt_type = kCGEventLeftMouseDragged if state.dragging else kCGEventMouseMoved
-                    post_mouse_event(evt_type, state.x, state.y)
+            if dist_delta < DEADBAND_PX:
+                pass
+            else:
+                t_factor = min(1.0, dist_delta / FAST_DIST_PX)
+                current_alpha = ALPHA_SLOW + (ALPHA_FAST - ALPHA_SLOW) * t_factor
+                state.x += dx * current_alpha
+                state.y += dy * current_alpha
             
-            elif abs(state.v_s) > SCROLL_DEADZONE:
-                if now - state.last_scroll_emit >= (1.0 / SCROLL_HZ):
-                    step_float = max(min(SCROLL_GAIN * state.v_s, SCROLL_MAX_STEP), -SCROLL_MAX_STEP)
-                    state.scroll_accum += step_float
-                    state.scroll_accum *= 0.90
-                    emit = int(state.scroll_accum)
-                    if emit != 0:
-                        event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 1, emit)
-                        CGEventPost(kCGHIDEventTap, event)
-                        state.scroll_accum -= emit
-                    state.last_scroll_emit = now
+            # Decide visual point
+            current_active_x, current_active_y = state.x, state.y
+            if state.snapped and not (state.dragging or state.scroll_mode or state.two_finger_active):
+                current_active_x, current_active_y = state.snap_x, state.snap_y
+            
+            state.active_x, state.active_y = current_active_x, current_active_y
 
-        time.sleep(max(0, dt - (time.perf_counter() - start_t)))
+            if state.dragging:
+                post_mouse(kCGEventLeftMouseDragged, state.active_x, state.active_y)
+            else:
+                post_mouse(kCGEventMouseMoved, state.active_x, state.active_y)
+                
+        time.sleep(max(0, (1/120.0) - (time.perf_counter() - start_t)))
 
 threading.Thread(target=cursor_thread, daemon=True).start()
 
-# --- MAIN INFERENCE LOOP ---
-cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
-cap.set(cv2.CAP_PROP_FPS, 30)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+def hotkey_loop():
+    def cb(proxy, type_, event, refcon):
+        if type_ == kCGEventKeyDown:
+            if CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == HOTKEY_KEYCODE:
+                if (CGEventGetFlags(event) & HOTKEY_FLAGS) == HOTKEY_FLAGS:
+                    state.paused = not state.paused
+                    return None
+        return event
+    tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, CGEventMaskBit(kCGEventKeyDown), cb, None)
+    if tap:
+        source = CFMachPortCreateRunLoopSource(None, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
+        CFRunLoopRun()
+
+threading.Thread(target=hotkey_loop, daemon=True).start()
+
+cap = cv2.VideoCapture(1)
+detector = mp_hands.Hands(
+    model_complexity=0, 
+    min_detection_confidence=0.8,
+    min_tracking_confidence=0.8
+)
 
 try:
-    detector = mp_hands.Hands(model_complexity=0, min_detection_confidence=0.7, min_tracking_confidence=0.7)
-    while cap.isOpened():
+    while cap.isOpened() and state.running:
         success, frame = cap.read()
         if not success: break
-        now = time.perf_counter()
-        frame = cv2.flip(frame, 1) if MIRROR else frame
+        frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        rgb.flags.writeable = False
         res = detector.process(rgb)
-        rgb.flags.writeable = True
-
+        
+        now = time.time()
+        mode_str = "NO HAND"
+        
         if res.multi_hand_landmarks:
-            state.last_hand_seen_time = now
-            state.hand_present_frames += 1
-            if state.hand_present_frames >= STABLE_FRAMES_REQ:
-                state.tracking_enabled = True
+            mode_str = "READY"
+            lms = res.multi_hand_landmarks[0].landmark
+            mp_drawing.draw_landmarks(frame, res.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
             
-            for hand_lms in res.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, hand_lms, mp_hands.HAND_CONNECTIONS)
-                lms = hand_lms.landmark
-                
-                hand_size = math.sqrt((lms[5].x - lms[17].x)**2 + (lms[5].y - lms[17].y)**2) or 0.01
-                index_dist = math.sqrt((lms[8].x - lms[4].x)**2 + (lms[8].y - lms[4].y)**2)
-                middle_dist = math.sqrt((lms[12].x - lms[4].x)**2 + (lms[12].y - lms[4].y)**2)
-                
-                index_pinch_ratio = index_dist / hand_size
-                middle_pinch_ratio = middle_dist / hand_size
-                index_clear = (index_pinch_ratio > PINCH_OFF + INDEX_CLEAR_MARGIN)
+            hand_size = math.sqrt((lms[5].x - lms[17].x)**2 + (lms[5].y - lms[17].y)**2)
+            hand_size = max(hand_size, 0.01)
+            def dist_n(a, b): return math.sqrt((lms[a].x-lms[b].x)**2 + (lms[a].y-lms[b].y)**2) / hand_size
+            
+            idx_ratio = dist_n(8, 4)
+            mid_ratio = dist_n(12, 4)
 
-                # Gesture conditions
-                two_finger_pinched = (index_pinch_ratio < TWO_FINGER_ON) and (middle_pinch_ratio < TWO_FINGER_ON)
-                two_finger_clear = (index_pinch_ratio > TWO_FINGER_OFF) and (middle_pinch_ratio > TWO_FINGER_OFF)
+            x_norm = max(0.0, min(1.0, (lms[8].x - ACTIVE_MIN) / (ACTIVE_MAX - ACTIVE_MIN)))
+            y_norm = max(0.0, min(1.0, (lms[8].y - ACTIVE_MIN) / (ACTIVE_MAX - ACTIVE_MIN)))
+            target_obs_x, target_obs_y = x_norm * SCREEN_W, y_norm * SCREEN_H
 
-                # --- 1. TWO-FINGER DOUBLE CLICK (PRIORITY OVERRIDE) ---
-                if two_finger_pinched and not state.two_finger_active:
-                    # Cancel all other interactions
-                    state.scroll_mode = False
-                    state.pending_single = False
-                    state.index_pinched = False
-                    state.dragging = False
-                    state.unpinch_frames = 0
-                    state.pinch_start_time = None
-                    state.drag_release_start = None
-                    state.click_lock_active = False
-
-                    # Fire OS double click immediately
-                    double_click(state.x, state.y)
-                    state.two_finger_active = True
-                    state.pointer_freeze_until = now + TWO_FINGER_FREEZE_S
-                    continue # Skip other gesture logic this frame
-
-                elif state.two_finger_active:
-                    if two_finger_clear:
-                        state.two_finger_active = False
-                    continue # Wait for release, skip other logic
-
-                # --- 2. SCROLL MODE CLUTCH ---
-                if middle_pinch_ratio < MIDDLE_PINCH_ON and index_clear:
-                    if not state.scroll_mode:
-                        if state.dragging:
-                            post_mouse_event(kCGEventLeftMouseUp, state.x, state.y, click_count=1)
-                        state.dragging = False
-                        state.index_pinched = False
-                        state.pinch_start_time = None
-                        state.pending_single = False
-                        state.click_lock_active = False
-                    state.scroll_mode = True
-                elif middle_pinch_ratio > MIDDLE_PINCH_OFF:
-                    state.scroll_mode = False
-
-                # Cursor Observation
-                x_norm = max(0, min((lms[8].x - ACTIVE_MIN) / (ACTIVE_MAX - ACTIVE_MIN), 1))
-                y_norm = max(0, min((lms[8].y - ACTIVE_MIN) / (ACTIVE_MAX - ACTIVE_MIN), 1))
-                new_obs_x, new_obs_y = x_norm * SCREEN_W, y_norm * SCREEN_H
-                
-                if not (now < state.pointer_freeze_until or state.click_lock_active or (state.index_pinched and not state.dragging)):
-                    if (lms[8].x < EDGE_MARGIN or lms[8].x > (1-EDGE_MARGIN) or lms[8].y < EDGE_MARGIN or lms[8].y > (1-EDGE_MARGIN)):
-                        state.obs_x += (new_obs_x - state.obs_x) * EDGE_DAMP_FACTOR
-                        state.obs_y += (new_obs_y - state.obs_y) * EDGE_DAMP_FACTOR
-                    else:
-                        state.obs_x, state.obs_y = new_obs_x, new_obs_y
-                    state.obs_time = now
-                    state.new_observation = True
-                    state.have_obs = True
-
-                # --- 3. INDEX PINCH STATE MACHINE (CLICK & DRAG) ---
-                if not state.scroll_mode:
-                    if not state.index_pinched and index_pinch_ratio < PINCH_ON:
-                        state.index_pinched = True
-                        state.pinch_start_time = now
-                        state.dragging = False
-                        state.unpinch_frames = 0
-                        state.click_lock_active = True
-                        state.vx = 0
-                        state.vy = 0
-                        state.click_anchor_x, state.click_anchor_y = state.x, state.y
-                    
-                    elif state.index_pinched:
-                        if state.dragging:
-                            if index_pinch_ratio > DRAG_RELEASE_RATIO:
-                                if state.drag_release_start is None:
-                                    state.drag_release_start = now
-                                elif (now - state.drag_release_start) >= DRAG_RELEASE_HOLD_S:
-                                    post_mouse_event(kCGEventLeftMouseUp, state.x, state.y, click_count=1)
-                                    state.dragging = False
-                                    state.index_pinched = False
-                                    state.click_lock_active = False
-                                    state.click_lock_until = now + CLICK_LOCK_EXTRA_S
-                            else:
-                                state.drag_release_start = None
-                        else:
-                            if index_pinch_ratio > PINCH_OFF:
-                                state.unpinch_frames += 1
-                            else:
-                                state.unpinch_frames = 0
-
-                            if state.unpinch_frames >= UNPINCH_STABLE_REQ:
-                                state.index_pinched = False
-                                state.click_lock_active = False
-                                
-                                # Mark for single click dispatcher (No timing upgrade to double)
-                                state.pending_single = True
-                                state.pending_single_time = now
-                                state.pending_anchor_x, state.pending_anchor_y = state.click_anchor_x, state.click_anchor_y
-                                state.click_lock_until = now + CLICK_LOCK_EXTRA_S
-                                
-                                state.pinch_start_time = None
-
-                        if state.index_pinched and not state.dragging:
-                            if (now - state.pinch_start_time >= DRAG_HOLD_S) and (index_pinch_ratio < DRAG_PINCH_ON):
-                                post_mouse_event(kCGEventLeftMouseDown, state.click_anchor_x, state.click_anchor_y, click_count=1)
-                                state.dragging = True
-                                state.click_lock_active = False
-                                state.drag_release_start = None
-                                state.pending_single = False
-
-                if state.scroll_mode:
-                    center_y = (lms[0].y + lms[9].y) / 2.0 * SCREEN_H
-                    if state.prev_center_y is not None and state.prev_center_t is not None:
-                        dt_s = max(0.01, now - state.prev_center_t)
-                        v_raw = (center_y - state.prev_center_y) / dt_s
-                        state.v_s = 0.12 * v_raw + 0.88 * state.v_s
-                    state.prev_center_y, state.prev_center_t = center_y, now
+            if not (state.two_finger_active or state.scroll_mode):
+                max_step = 55.0 if state.dragging else MAX_STEP_PX
+                dx = target_obs_x - state.obs_x
+                dy = target_obs_y - state.obs_y
+                dist = math.hypot(dx, dy)
+                if dist > max_step:
+                    scale = max_step / dist
+                    state.obs_x += dx * scale
+                    state.obs_y += dy * scale
                 else:
-                    state.v_s = 0.0
-                    state.prev_center_y, state.prev_center_t = None, None
+                    state.obs_x, state.obs_y = target_obs_x, target_obs_y
 
-            # --- 4. PENDING SINGLE CLICK DISPATCHER ---
-            if state.pending_single:
-                if (now - state.pending_single_time) > SINGLE_CLICK_DELAY_S:
-                    state.pointer_freeze_until = now + PRECISION_LOCK_S
-                    state.vx = 0
-                    state.vy = 0
-                    state.x = state.pending_anchor_x
-                    state.y = state.pending_anchor_y
-                    post_mouse_event(kCGEventMouseMoved, state.x, state.y)
-                    
-                    time.sleep(PRECISION_LOCK_S)
-                    single_click_precise(state.pending_anchor_x, state.pending_anchor_y)
-                    
-                    state.pending_single = False
-                    state.pointer_freeze_until = time.perf_counter() + CLICK_FREEZE_AFTER_CLICK_S
-
-        else:
-            state.hand_present_frames = 0
-            if now - state.last_hand_seen_time > LOST_TIMEOUT:
-                state.tracking_enabled = False
-                reset_gestures()
-
-        status = "PAUSED" if state.paused else ("NO HAND" if not state.tracking_enabled else ("DOUBLE CLICKING" if state.two_finger_active else ("SCROLLING" if state.scroll_mode else ("DRAGGING" if state.dragging else "READY"))))
-        color = (0, 0, 255) if state.paused or not state.tracking_enabled else (0, 255, 0)
-        cv2.putText(frame, f"v4.0 | {status}", (20, 40), 1, 1.4, color, 2)
-        if state.index_pinched and not state.dragging:
-            progress = min(1.0, (now - state.pinch_start_time) / DRAG_HOLD_S)
-            cv2.rectangle(frame, (20, 60), (20 + int(progress*150), 75), (255, 255, 0), -1)
+            if now - state.last_ax_query_t > 0.05:
+                ax, ay = action_pos()
+                if not (state.dragging or state.scroll_mode or state.two_finger_active):
+                    state.target_data = snap_targeting.find_actionable_target(ax, ay)
+                    state.snapped, (state.snap_x, state.snap_y) = snap_controller.update(ax, ay, state.target_data)
+                else:
+                    state.snapped = False
+                state.last_ax_query_t = now
             
-        cv2.imshow('Air Mouse Pro', frame)
+            overlay.update(state.snapped, (state.snap_x, state.snap_y), 
+                           state.target_data['bounds'] if state.target_data else None)
+
+            two_finger_pinched = (idx_ratio < TWO_FINGER_ON) and (mid_ratio < TWO_FINGER_ON)
+            two_finger_clear   = (idx_ratio > TWO_FINGER_OFF) and (mid_ratio > TWO_FINGER_OFF)
+            index_clear = (idx_ratio > (PINCH_OFF + INDEX_CLEAR_MARGIN))
+            scroll_pinched = (mid_ratio < MIDDLE_PINCH_ON) and index_clear
+            scroll_clear   = (mid_ratio > MIDDLE_PINCH_OFF)
+            
+            if not state.index_pinched and idx_ratio < PINCH_ON: state.index_pinched = True
+            elif state.index_pinched and idx_ratio > PINCH_OFF: state.index_pinched = False
+
+            # ----- GESTURE PRIORITY ENGINE -----
+            handled = False
+            if now < state.freeze_until:
+                mode_str = "FREEZING"
+                handled = True
+            else:
+                # 1. DOUBLE CLICK
+                if two_finger_pinched and not state.two_finger_active and (now - state.last_double_t) > 0.42:
+                    state.scroll_mode = False
+                    if state.dragging: 
+                        post_mouse(kCGEventLeftMouseUp, *action_pos())
+                        state.dragging = False
+                    state.pinch_active = False
+                    state.two_finger_active = True
+                    double_click(*action_pos())
+                    state.last_double_t = now
+                    state.freeze_until = now + TWO_FINGER_FREEZE_S
+                    mode_str = "DOUBLE CLICK"
+                    handled = True
+                elif state.two_finger_active:
+                    mode_str = "DOUBLE CLICK (HOLD)"
+                    if two_finger_clear: state.two_finger_active = False
+                    handled = True
+            
+            if not handled:
+                # 2. CLOSED FIST -> MINIMIZE
+                busy = state.index_pinched or state.two_finger_active or state.scroll_mode or state.dragging or state.pinch_active
+                fist_now = (not busy) and is_closed_fist(lms, hand_size)
+                
+                if fist_now:
+                    if state.fist_start_t is None:
+                        state.fist_start_t = now
+                    else:
+                        held = now - state.fist_start_t
+                        if held >= FIST_HOLD_S and (now - state.last_fist_action_t) >= FIST_COOLDOWN_S:
+                            send_cmd_m()
+                            state.last_fist_action_t = now
+                            state.freeze_until = now + 0.25
+                            mode_str = "MINIMIZE!"
+                            state.fist_start_t = None
+                            handled = True
+                else:
+                    state.fist_start_t = None
+
+                # 3. SCROLL CLUTCH
+                if not handled and scroll_pinched and not state.pinch_active and not state.dragging:
+                    mode_str = "SCROLLING"
+                    if not state.scroll_mode:
+                        state.scroll_mode = True
+                        state.scroll_start_t = now
+                        state.last_mid_y = lms[12].y
+                        state.last_scroll_emit = now
+                    
+                    if (now - state.scroll_start_t) > 0.08:
+                        dy = (lms[12].y - state.last_mid_y) * SCREEN_H * SCROLL_MULT
+                        if abs(dy) < SCROLL_DEADZONE_PX: dy = 0
+                        if dy != 0 and (now - state.last_scroll_emit) >= 0.016:
+                            post_scroll(0, -dy)
+                            state.last_scroll_emit = now
+                    state.last_mid_y = lms[12].y
+                    handled = True
+
+                elif state.scroll_mode:
+                    if scroll_clear:
+                        state.scroll_mode = False
+                        if hasattr(state, 'last_mid_y'): del state.last_mid_y
+
+                # 4. SINGLE PINCH (CLICK/DRAG)
+                if not handled and state.index_pinched:
+                    if not state.pinch_active:
+                        state.pinch_active = True
+                        state.pinch_start_t = now
+                        state.did_drag_this_pinch = False
+                        state.drag_release_start = None
+                    
+                    hold = now - state.pinch_start_t
+                    if hold > DRAG_HOLD_S:
+                        mode_str = "DRAGGING"
+                        if not state.dragging:
+                            state.drag_anchor_x, state.drag_anchor_y = action_pos()
+                            post_mouse(kCGEventLeftMouseDown, state.drag_anchor_x, state.drag_anchor_y)
+                            state.dragging = True
+                            state.did_drag_this_pinch = True
+                            state.drag_release_start = None
+                    else:
+                        mode_str = "PINCHING"
+                    handled = True
+                
+                # 5. RELEASE BLOCK
+                if not handled:
+                    if state.dragging:
+                        # Drag release hysteresis
+                        if not state.index_pinched:
+                            if state.drag_release_start is None:
+                                state.drag_release_start = now
+                            elif (now - state.drag_release_start) >= DRAG_RELEASE_CONFIRM_S:
+                                post_mouse(kCGEventLeftMouseUp, *action_pos())
+                                state.dragging = False
+                                state.drag_release_start = None
+                                state.pinch_active = False
+                        else:
+                            state.drag_release_start = None
+                    else:
+                        if state.pinch_active and (not state.did_drag_this_pinch) and (now - state.last_click_t) > 0.13:
+                            cx, cy = action_pos()
+                            ok = state.snapped and snap_targeting.perform_click(state.target_data)
+                            if not ok:
+                                post_mouse(kCGEventLeftMouseDown, cx, cy)
+                                post_mouse(kCGEventLeftMouseUp, cx, cy)
+                            state.last_click_t = now
+                        
+                        state.pinch_active = False
+                        state.did_drag_this_pinch = False
+                        state.scroll_mode = False
+                        state.two_finger_active = False
+
+        if state.paused: mode_str = "PAUSED"
+        hud = [f"MODE: {mode_str}", f"SNAPPED: {state.snapped}", f"Snap d: {snap_controller.last_dist:.1f}px"]
+        if state.fist_start_t: hud.append(f"Fist Hold: {now - state.fist_start_t:.1f}s")
+        if state.target_data: hud.append(f"Target: {int(state.target_data['bounds'][2])}x{int(state.target_data['bounds'][3])}")
+        
+        ov_hud = frame.copy()
+        cv2.rectangle(ov_hud, (5, 5), (320, 5 + 26*len(hud)+12), (0, 0, 0), -1)
+        cv2.addWeighted(ov_hud, 0.45, frame, 0.55, 0, frame)
+        for i, line in enumerate(hud): cv2.putText(frame, line, (12, 30+i*26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
+        
+        cv2.imshow('Air Mouse Pro v5.1 Precision+', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 finally:
     state.running = False
+    overlay.cleanup()
     cap.release()
     cv2.destroyAllWindows()

@@ -1,5 +1,8 @@
 
 numpy<2.0
-mediapipe
+mediapipe==0.10.11
 opencv-python
 pyobjc
+pyobjc-framework-Quartz
+pyobjc-framework-AppKit
+pyobjc-framework-ApplicationServices
